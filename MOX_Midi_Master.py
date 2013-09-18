@@ -20,16 +20,13 @@ along with moxmidimaster.  If not, see <http://www.gnu.org/licenses/>.
 from Tkinter import *
 import multiprocessing
 import Queue
-import win32com.client
-import pythoncom
-import win32api
-import win32con
 import threading
 import tkFileDialog
 import pickle
 import imp
 import os
 import time
+import pygame.midi as pym
 
 class Proxy(object):
     def __init__(self, name, queue):
@@ -172,13 +169,11 @@ class Logic(object):
         self.modules = [self]
         self.output = self.final_handle
 
-        main_thread_id = win32api.GetCurrentThreadId()
         def message_loop_thread():
             while True:
                 try:
                     message = ui_to_main.get()
                     if message is None:
-                        win32api.PostThreadMessage(main_thread_id, win32con.WM_QUIT, 0, 0);
                         return
 
                     module_name, function_name, args, kwargs = message
@@ -209,17 +204,36 @@ class Logic(object):
         del self.modules_map[module.name]
 
 
-class EventHandler(object):
-    def OnSysExInput(self, bStrSysEx):
-        self.SendSysExString(bStrSysEx)
+class Mox(object):
+    def __init__(self):
+        self.pin = {}
+        self.pout = {}
+        for i in xrange(pym.get_count()):
+            info = pym.get_device_info(i)
+            if info[2]:
+                self.pin[i] = pym.Input(i)
+            if info[3]:
+                self.pout[i] = pym.Output(i)
+                
+        self.thread = threading.Thread(target=self._run)
+        self.thread.daemon = True
+        self.thread.start()
 
-    def OnTerminateMidiInput(self):
-        self.FireMidiInput = 0
-        self.DivertMidiInput = 0
+    def _run(self):
+        while True:
+            any_handled = False
+            for i, dev in self.pin.iteritems():
+                if not dev.poll() or self.logic is None:
+                    continue
+                for event, timestamp in dev.read(10):
+                    status, data1, data2, data3 = event
+                    self.logic.handle(time.clock(), i , status & 0xF, status >> 4, data1, data2)
 
-    def OnMidiInput(self, nTimestamp, port, status, data1, data2):
-        self.logic.handle(nTimestamp, port + 1, status & 0xF, status >> 4, data1, data2)
-
+            if not any_handled:
+                time.sleep(0.005)
+    
+    def OutputMidiMsg(self, port, status, data1, data2):
+        self.pout[port].write_short(status, data1, data2)
 
 def master_ui(ui_to_main, main_to_ui, initial_data):
     MasterUI(ui_to_main, main_to_ui, initial_data).mainloop()
@@ -227,22 +241,22 @@ def master_ui(ui_to_main, main_to_ui, initial_data):
 
 
 def create_initial_data(mox):
-    def get_ports(type):
-        name = "OpenMidi%sDev" % type
-        getportid = getattr(mox, "Get%sPortID" % type)
-        portname = getattr(mox, "GetFirstOpenMidi%sDev" % type)()
-        getnext = getattr(mox, "GetNextOpenMidi%sDev" % type)
-        result = {}
-        while portname:
-            result[portname] = getportid(portname)
-            portname = getnext()
-        return result
+    pin = {}
+    pout = {}
+    for i in xrange(pym.get_count()):
+        info = pym.get_device_info(i)
+        name = info[1]
+        if info[2]:
+            pin[name] = i
+        if info[3]:
+            pout[name] = i
     
-    return {"ports_in": get_ports("In"), "ports_out": get_ports("Out")}
+    return {"ports_in": pin, "ports_out": pout}
 
 
 if __name__ == "__main__":
-    mox = win32com.client.DispatchWithEvents("MIDIOX.MoxScript.1", EventHandler)
+    pym.init()
+    mox = Mox()
     
     ui_to_main = multiprocessing.Queue()
     main_to_ui = multiprocessing.Queue()
@@ -250,15 +264,5 @@ if __name__ == "__main__":
     ui_process.start()
 
     logic = Logic(mox, main_to_ui, ui_to_main)
-
-    mox.DivertMidiInput = 1
-    mox.FireMidiInput = 1    
-    
-    pythoncom.PumpMessages()
-
-    mox.FireMidiInput = 0
-    mox.DivertMidiInput = 0
-    
-    mox.logic = None
-    del logic
-    del mox
+    raw_input("Enter to stop...")
+    sys.exit(0)
